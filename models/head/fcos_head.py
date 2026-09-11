@@ -11,10 +11,12 @@ class FCOSHead(nn.Module):
         num_classes=10,
         num_convs=4,
         prior_prob=0.01,
+        strides=(4, 8, 16, 32),
     ):
         super().__init__()
 
         self.num_classes = num_classes
+        self.strides = strides
 
         # Shared convolutional tower.
         cls_tower = []
@@ -123,7 +125,7 @@ class FCOSHead(nn.Module):
 
         outputs = []
 
-        for feature in features:
+        for feature, stride in zip(features, self.strides):
             cls_features = self.cls_tower(feature)
             bbox_features = self.bbox_tower(feature)
 
@@ -131,8 +133,11 @@ class FCOSHead(nn.Module):
 
             bbox_reg = self.bbox_reg(bbox_features)
 
-            
-            bbox_reg = F.softplus(bbox_reg)
+            # Regression output is in raw activation units;
+            # scale by the level's stride to bring it into
+            # input-image pixel units, matching how
+            # FCOSTargetAssigner encodes bbox_targets.
+            bbox_reg = F.softplus(bbox_reg) * stride
 
             centerness = self.centerness(bbox_features)
 
