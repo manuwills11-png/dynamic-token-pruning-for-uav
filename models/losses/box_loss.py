@@ -10,10 +10,11 @@ class DIoULoss(nn.Module):
         [x1, y1, x2, y2]
     """
 
-    def __init__(self, eps=1e-7):
+    def __init__(self, eps=1e-7, reduction="mean"):
         super().__init__()
 
         self.eps = eps
+        self.reduction = reduction
 
     def forward(self, pred_boxes, target_boxes):
         """
@@ -150,5 +151,11 @@ class DIoULoss(nn.Module):
             - iou
             + center_distance / enclosing_diagonal
         )
+
+        if self.reduction == "sum":
+            return diou.sum()
+
+        if self.reduction == "none":
+            return diou
 
         return diou.mean()

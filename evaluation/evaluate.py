@@ -274,7 +274,7 @@ def run_evaluation(
             raw_outputs = model(model_input)
 
             boxes_xyxy, scores, class_idx = decode_fcos_predictions(
-                raw_outputs, strides=(8, 16, 32, 64), score_threshold=score_threshold
+                raw_outputs, strides=(4, 8, 16, 32), score_threshold=score_threshold
             )
 
             keep = scores >= score_threshold

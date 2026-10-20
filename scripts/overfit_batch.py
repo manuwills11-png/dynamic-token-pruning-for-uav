@@ -187,6 +187,23 @@ def main():
         )
 
     # ---------------------------------------------------------
+    # Irreducible part of the loss
+    #
+    # Centerness targets are soft, so their BCE term bottoms out at
+    # a strictly positive value. Convergence is measured against
+    # that floor rather than against zero.
+    # ---------------------------------------------------------
+
+    centerness_floor = loss_fn.centerness_floor(
+        fcos_targets
+    )
+
+    print(
+        f"Centerness floor (irreducible): "
+        f"{centerness_floor:.6f}"
+    )
+
+    # ---------------------------------------------------------
     # Initial loss
     # ---------------------------------------------------------
 
@@ -228,6 +245,11 @@ def main():
 
         loss.backward()
 
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_norm=10.0,
+        )
+
         optimizer.step()
 
         if (
@@ -250,9 +272,17 @@ def main():
 
     final_loss = loss.item()
 
+    reducible_initial = (
+        initial_loss_value - centerness_floor
+    )
+
+    reducible_final = (
+        final_loss - centerness_floor
+    )
+
     reduction = (
         1.0
-        - final_loss / initial_loss_value
+        - reducible_final / reducible_initial
     ) * 100.0
 
     print()
@@ -268,17 +298,32 @@ def main():
     )
 
     print(
-        f"Loss reduction: "
+        f"Centerness floor: "
+        f"{centerness_floor:.6f}"
+    )
+
+    print(
+        f"Reducible initial: "
+        f"{reducible_initial:.6f}"
+    )
+
+    print(
+        f"Reducible final:   "
+        f"{reducible_final:.6f}"
+    )
+
+    print(
+        f"Reducible loss reduction: "
         f"{reduction:.2f}%"
     )
 
-    if final_loss < initial_loss_value * 0.10:
+    if reducible_final < reducible_initial * 0.10:
 
         print()
 
         print(
-            "PASS: 6-image overfit loss < 10% "
-            "of initial loss"
+            "PASS: 6-image overfit reducible loss < 10% "
+            "of initial reducible loss"
         )
 
     else:
@@ -286,8 +331,8 @@ def main():
         print()
 
         print(
-            "FAIL: 6-image overfit did not reach "
-            "10% of initial loss"
+            "FAIL: 6-image overfit did not reach 10% "
+            "of initial reducible loss"
         )
 
 

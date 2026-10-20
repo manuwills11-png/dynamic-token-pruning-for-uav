@@ -22,10 +22,16 @@ class FCOSLoss(nn.Module):
         self.cls_loss = SigmoidFocalLoss(
             alpha=0.25,
             gamma=2.0,
+            reduction="sum",
         )
 
-        self.box_loss = DIoULoss()
-        self.centerness_loss = CenternessLoss()
+        self.box_loss = DIoULoss(
+            reduction="none",
+        )
+
+        self.centerness_loss = CenternessLoss(
+            reduction="sum",
+        )
 
     def forward(
         self,
@@ -69,14 +75,20 @@ class FCOSLoss(nn.Module):
                 f"got {len(targets)}"
             )
 
-        total_cls_loss = 0.0
-        total_box_loss = 0.0
-        total_ctr_loss = 0.0
-        total_positive = 0
+        # ---------------------------------------------------------
+        # Flatten every level and every image into one flat set of
+        # locations, so all three terms can be normalized by the
+        # batch-wide positive count the way FCOS defines them.
+        # ---------------------------------------------------------
 
-        # ---------------------------------------------------------
-        # Process each FPN level
-        # ---------------------------------------------------------
+        cls_logits_all = []
+        bbox_reg_all = []
+        centerness_all = []
+
+        locations_all = []
+        cls_targets_all = []
+        bbox_targets_all = []
+        ctr_targets_all = []
 
         for level, prediction in enumerate(predictions):
 
@@ -85,10 +97,6 @@ class FCOSLoss(nn.Module):
             centerness = prediction["centerness"]
 
             B, num_classes, H, W = cls_logits.shape
-
-            # -----------------------------------------------------
-            # Flatten predictions
-            # -----------------------------------------------------
 
             cls_logits = cls_logits.permute(
                 0, 2, 3, 1
@@ -113,16 +121,6 @@ class FCOSLoss(nn.Module):
                 H * W,
             )
 
-            level_cls_loss = 0.0
-            level_box_loss = 0.0
-            level_ctr_loss = 0.0
-
-            level_positive = 0
-
-            # -----------------------------------------------------
-            # Process every image independently
-            # -----------------------------------------------------
-
             for image_idx in range(batch_size):
 
                 (
@@ -132,115 +130,112 @@ class FCOSLoss(nn.Module):
                     ctr_targets,
                 ) = targets[image_idx][level]
 
-                positive = cls_targets >= 0
-
-                num_positive = positive.sum().item()
-                level_positive += num_positive
-
-                # -------------------------------------------------
-                # Classification targets
-                #
-                # -1 = background
-                #  0..9 = object class
-                #
-                # Background therefore becomes an all-zero
-                # one-hot target.
-                # -------------------------------------------------
-
-                cls_target_one_hot = torch.zeros(
-                    H * W,
-                    num_classes,
-                    device=cls_logits.device,
-                    dtype=cls_logits.dtype,
+                cls_logits_all.append(
+                    cls_logits[image_idx]
                 )
 
-                if positive.any():
-                    positive_indices = positive.nonzero(
-                        as_tuple=False
-                    ).squeeze(1)
-
-                    cls_target_one_hot[
-                        positive_indices,
-                        cls_targets[positive],
-                    ] = 1.0
-
-                level_cls_loss += self.cls_loss(
-                    cls_logits[image_idx],
-                    cls_target_one_hot,
+                bbox_reg_all.append(
+                    bbox_reg[image_idx]
                 )
 
-                # -------------------------------------------------
-                # Regression + centerness
-                # -------------------------------------------------
+                centerness_all.append(
+                    centerness[image_idx]
+                )
 
-                if positive.any():
+                locations_all.append(locations)
+                cls_targets_all.append(cls_targets)
+                bbox_targets_all.append(bbox_targets)
+                ctr_targets_all.append(ctr_targets)
 
-                    positive_indices = positive.nonzero(
-                        as_tuple=False
-                    ).squeeze(1)
+        cls_logits_all = torch.cat(cls_logits_all, dim=0)
+        bbox_reg_all = torch.cat(bbox_reg_all, dim=0)
+        centerness_all = torch.cat(centerness_all, dim=0)
 
-                    pred_ltrb = bbox_reg[
-                        image_idx,
-                        positive_indices,
-                    ]
+        locations_all = torch.cat(locations_all, dim=0)
+        cls_targets_all = torch.cat(cls_targets_all, dim=0)
+        bbox_targets_all = torch.cat(bbox_targets_all, dim=0)
+        ctr_targets_all = torch.cat(ctr_targets_all, dim=0)
 
-                    target_ltrb = bbox_targets[
-                        positive_indices
-                    ]
+        positive = cls_targets_all >= 0
 
-                    positive_locations = locations[
-                        positive_indices
-                    ]
+        num_positive = int(positive.sum())
 
-                    pred_boxes = self._decode_boxes(
-                        positive_locations,
-                        pred_ltrb,
-                    )
+        positive_indices = positive.nonzero(
+            as_tuple=False
+        ).squeeze(1)
 
-                    target_boxes = self._decode_boxes(
-                        positive_locations,
-                        target_ltrb,
-                    )
-
-                    level_box_loss += self.box_loss(
-                        pred_boxes,
-                        target_boxes,
-                    )
-
-                    pred_ctr = centerness[
-                        image_idx,
-                        positive_indices,
-                    ]
-
-                    target_ctr = ctr_targets[
-                        positive_indices
-                    ]
-
-                    level_ctr_loss += self.centerness_loss(
-                        pred_ctr,
-                        target_ctr,
-                    )
-
-            total_cls_loss += level_cls_loss
-            total_box_loss += level_box_loss
-            total_ctr_loss += level_ctr_loss
-            total_positive += level_positive
+        # Normalizing by the batch-wide positive count keeps the loss
+        # magnitude independent of batch size and FPN level count.
+        normalizer = max(num_positive, 1)
 
         # ---------------------------------------------------------
-        # Avoid invalid regression loss when no objects exist.
+        # Classification
+        #
+        # -1 = background, which becomes an all-zero one-hot target.
         # ---------------------------------------------------------
 
-        if total_positive == 0:
-            zero = (
-                predictions[0]["cls_logits"].sum() * 0.0
+        cls_target_one_hot = torch.zeros_like(
+            cls_logits_all
+        )
+
+        if num_positive > 0:
+            cls_target_one_hot[
+                positive_indices,
+                cls_targets_all[positive_indices],
+            ] = 1.0
+
+        total_cls_loss = self.cls_loss(
+            cls_logits_all,
+            cls_target_one_hot,
+        ) / normalizer
+
+        # ---------------------------------------------------------
+        # Regression + centerness
+        # ---------------------------------------------------------
+
+        if num_positive > 0:
+
+            positive_locations = locations_all[
+                positive_indices
+            ]
+
+            pred_boxes = self._decode_boxes(
+                positive_locations,
+                bbox_reg_all[positive_indices],
             )
 
-            return zero, {
-                "cls_loss": float(total_cls_loss.detach()),
-                "box_loss": 0.0,
-                "centerness_loss": 0.0,
-                "num_positive": 0,
-            }
+            target_boxes = self._decode_boxes(
+                positive_locations,
+                bbox_targets_all[positive_indices],
+            )
+
+            positive_ctr_targets = ctr_targets_all[
+                positive_indices
+            ]
+
+            diou = self.box_loss(
+                pred_boxes,
+                target_boxes,
+            )
+
+            # FCOS weights regression by the centerness target so
+            # locations near a box centre dominate the signal.
+            centerness_sum = positive_ctr_targets.sum().clamp(
+                min=1e-6
+            )
+
+            total_box_loss = (
+                diou * positive_ctr_targets
+            ).sum() / centerness_sum
+
+            total_ctr_loss = self.centerness_loss(
+                centerness_all[positive_indices],
+                positive_ctr_targets,
+            ) / normalizer
+
+        else:
+            total_box_loss = bbox_reg_all.sum() * 0.0
+            total_ctr_loss = centerness_all.sum() * 0.0
 
         total_loss = (
             self.lambda_cls * total_cls_loss
@@ -258,8 +253,59 @@ class FCOSLoss(nn.Module):
             "centerness_loss": float(
                 total_ctr_loss.detach()
             ),
-            "num_positive": total_positive,
+            "num_positive": num_positive,
         }
+
+    def centerness_floor(self, targets):
+        """
+        Smallest centerness term any model can reach.
+
+        Centerness targets are continuous in (0, 1), and BCE against a
+        soft target t is minimized at p == t where it equals the binary
+        entropy H(t) = -t*log(t) - (1-t)*log(1-t), which is strictly
+        positive. The centerness term therefore never reaches zero, so
+        convergence has to be judged against this floor and not against
+        zero.
+
+        Args:
+            targets:
+                Same structure the forward pass takes.
+
+        Returns:
+            Float contribution of a perfectly fitted centerness branch
+            to the total loss, lambda_ctr included.
+        """
+
+        positive_targets = []
+
+        for image_targets in targets:
+            for level_target in image_targets:
+
+                cls_targets = level_target[1]
+                ctr_targets = level_target[3]
+
+                positive = cls_targets >= 0
+
+                if positive.any():
+                    positive_targets.append(
+                        ctr_targets[positive]
+                    )
+
+        if not positive_targets:
+            return 0.0
+
+        t = torch.cat(
+            positive_targets
+        ).clamp(1e-6, 1.0 - 1e-6)
+
+        entropy = -(
+            t * torch.log(t)
+            + (1.0 - t) * torch.log1p(-t)
+        )
+
+        return float(
+            self.lambda_ctr * entropy.mean()
+        )
 
     @staticmethod
     def _decode_boxes(

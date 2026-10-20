@@ -8,11 +8,13 @@ class SigmoidFocalLoss(nn.Module):
         self,
         alpha=0.25,
         gamma=2.0,
+        reduction="mean",
     ):
         super().__init__()
 
         self.alpha = alpha
         self.gamma = gamma
+        self.reduction = reduction
 
     def forward(self, logits, targets):
         """
@@ -54,5 +56,11 @@ class SigmoidFocalLoss(nn.Module):
         )
 
         loss = focal_weight * bce
+
+        if self.reduction == "sum":
+            return loss.sum()
+
+        if self.reduction == "none":
+            return loss
 
         return loss.mean()

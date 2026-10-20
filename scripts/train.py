@@ -221,6 +221,11 @@ def main():
     # Optimizer step
     # ---------------------------------------------------------
 
+    torch.nn.utils.clip_grad_norm_(
+        model.parameters(),
+        max_norm=10.0,
+    )
+
     optimizer.step()
 
     print()
